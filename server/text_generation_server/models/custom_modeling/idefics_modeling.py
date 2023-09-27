@@ -55,7 +55,8 @@ from text_generation_server.utils.layers import (
     PositionRotaryEmbedding,
     FastLinear,
 )
-import dropout_layer_norm
+if torch.cuda.is_available():
+    import dropout_layer_norm
 
 
 @dataclass
@@ -354,7 +355,7 @@ class IdeficsRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states, residual=None):
-        if hidden_states.shape[-1] > 8192:
+        if hidden_states.shape[-1] > 8192 or not torch.cuda.is_available():
             if residual is not None:
                 hidden_states += residual
             residual = hidden_states

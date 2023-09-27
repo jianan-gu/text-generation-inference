@@ -509,11 +509,12 @@ class TensorParallelEmbedding(nn.Module):
 
 
 try:
-    import dropout_layer_norm
+    if torch.cuda.is_available():
+        import dropout_layer_norm
 
     class FastLayerNorm(nn.LayerNorm):
         def forward(self, hidden_states, residual=None):
-            if hidden_states.shape[-1] > 8192:
+            if hidden_states.shape[-1] > 8192 or not torch.cuda.is_available():
                 if residual is not None:
                     hidden_states += residual
                 residual = hidden_states
@@ -551,8 +552,9 @@ except ImportError:
 
 
 try:
-    from flash_attn.layers.rotary import RotaryEmbedding
-    import rotary_emb
+    if torch.cuda.is_available():
+        from flash_attn.layers.rotary import RotaryEmbedding
+        import rotary_emb
 
     def _create_inv_freq(dim, base, device):
         inv_freq = 1.0 / (
@@ -694,8 +696,12 @@ try:
             rotary_dim = cos.shape[-1]
             x1 = x[..., :rotary_dim]
             x2 = x[..., rotary_dim : 2 * rotary_dim]
-
-            rotary_emb.apply_rotary(x1, x2, cos, sin, x1, x2, False)
+            if torch.cuda.is_available():
+                rotary_emb.apply_rotary(x1, x2, cos, sin, x1, x2, False)
+            else:
+                c = x1 * cos - x2 * sin
+                d = x1 * sin + x2 * cos
+                x.copy_(torch.cat([c,d],dim=-1))
             return x
 
     class DynamicPositionRotaryEmbedding(PositionRotaryEmbedding):

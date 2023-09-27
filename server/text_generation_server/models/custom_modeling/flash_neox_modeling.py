@@ -28,7 +28,7 @@ from transformers.models.gpt_neox import GPTNeoXConfig
 from typing import Optional, List, Tuple
 
 from text_generation_server.utils import paged_attention, flash_attn
-from text_generation_server.utils.flash_attn import attention
+from text_generation_server.utils.flash_attn import attention, ref_reshape_and_cache, ref_single_query_cached_kv_attention
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
@@ -138,9 +138,12 @@ class FlashNeoxAttention(torch.nn.Module):
         self.rotary_emb(qkv[:, 0], cos, sin)
         self.rotary_emb(qkv[:, 1], cos, sin)
 
-        paged_attention.reshape_and_cache(
-            qkv[:, 1], qkv[:, 2], kv_cache[0], kv_cache[1], slots
-        )
+        if torch.cuda.is_available():
+            paged_attention.reshape_and_cache(
+                qkv[:, 1], qkv[:, 2], kv_cache[0], kv_cache[1], slots
+            )
+        else:
+            ref_reshape_and_cache(qkv[:, 1], qkv[:, 2], kv_cache[0], kv_cache[1], slots)
 
         # output tensor
         attn_output = torch.empty_like(qkv[:, 0])
@@ -159,17 +162,29 @@ class FlashNeoxAttention(torch.nn.Module):
             )
         # Decode
         else:
-            paged_attention.attention(
-                attn_output,
-                qkv[:, 0],
-                kv_cache[0],
-                kv_cache[1],
-                self.kv_head_mapping,
-                self.softmax_scale,
-                block_tables,
-                input_lengths,
-                max_s,
-            )
+            # kv_cache[1] => [num_blocks, num_heads, head_size, block_size]
+            if torch.cuda.is_available():
+                paged_attention.attention(
+                    attn_output,
+                    qkv[:, 0],
+                    kv_cache[0],
+                    kv_cache[1],
+                    self.kv_head_mapping,
+                    self.softmax_scale,
+                    block_tables,
+                    input_lengths,
+                    max_s,
+                )
+            else:
+                ref_single_query_cached_kv_attention(
+                    attn_output,
+                    qkv[:, 0],
+                    kv_cache[0],
+                    kv_cache[1],
+                    block_tables,
+                    input_lengths,
+                )
+
 
         return self.dense(attn_output.view(-1, self.num_heads * self.head_size))
 

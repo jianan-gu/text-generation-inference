@@ -35,7 +35,8 @@ class FlashSantacoderSharded(FlashCausalLM):
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16 if dtype is None else dtype
         else:
-            raise NotImplementedError("FlashSantacoderSharded is only available on GPU")
+            device = torch.device("cpu")
+            dtype = torch.bfloat16 if dtype is None else dtype
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
