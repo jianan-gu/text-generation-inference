@@ -226,5 +226,5 @@ ENTRYPOINT ["./entrypoint.sh"]
 # Final image
 FROM base
 
-ENTRYPOINT ["text-generation-launcher"]
-CMD ["--json-output"]
+#ENTRYPOINT ["text-generation-launcher"]
+#CMD ["--json-output"]

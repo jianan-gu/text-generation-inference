@@ -1,7 +1,8 @@
 from text_generation_server.utils.tokens import batch_top_tokens
 import torch
+import intel_extension_for_pytorch as ipex
 import inspect
-
+from loguru import logger
 from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
@@ -223,17 +224,17 @@ class CausalLMBatch(Batch):
         # Update tensors in-place to allow incremental garbage collection
         past_kv_length = max_input_length - 1
         for layer in self.past_key_values:
-            past_keys, past_values = layer
+            _, past_keys, past_values, _ = layer
             if len(past_keys.shape) == 3:
                 # Force past to be of dim [self_size, num_heads, ...] for easy indexing
                 past_keys = past_keys.view(len(self), -1, *past_keys.shape[-2:])
                 past_values = past_values.view(len(self), -1, *past_values.shape[-2:])
             if self.keys_head_dim_last:
-                layer[0] = past_keys[keep_indices, :, -past_kv_length:, :]
+                layer[0] = past_keys[-past_kv_length:, keep_indices, :,  :]
             else:
-                layer[0] = past_keys[keep_indices, :, :, -past_kv_length:]
+                layer[0] = past_keys[-past_kv_length:, keep_indices, :, :]
             del past_keys
-            layer[1] = past_values[keep_indices, :, -past_kv_length:, :]
+            layer[1] = past_values[-past_kv_length:, keep_indices, :,  :]
             del past_values
 
         top_n_tokens_tensor = self.top_n_tokens_tensor[keep_indices]
@@ -363,7 +364,7 @@ class CausalLMBatch(Batch):
             # And ensure that we can update tensors in-place
             if type(batch.past_key_values[0]) == tuple:
                 batch.past_key_values = [
-                    [t.view(len(batch), -1, *t.shape[-2:]) for t in layer]
+                    [ t.view(-1, len(batch), *t.shape[-2:]) for t in layer]
                     for layer in batch.past_key_values
                 ]
             elif len(batch.past_key_values[0][0].shape) == 3:
@@ -379,14 +380,20 @@ class CausalLMBatch(Batch):
             start_index = end_index
 
         first_past_kvs = batches[0].past_key_values
-        _, num_heads, padded_sequence_length, head_dim = first_past_kvs[0][1].shape
+        # _, num_heads, padded_sequence_length, head_dim = first_past_kvs[0][1].shape
+
+        _, _, padded_sequence_length, _ = first_past_kvs[0][0].shape
+        _, _, num_heads, head_dim = first_past_kvs[0][1].shape
 
         padded_past_values_shape = (
+            max_input_length - 1,
             total_batch_size,
             num_heads,
-            max_input_length - 1,
             head_dim,
         )
+
+        logger.info("padded_past_values_shape")
+        logger.info(padded_past_values_shape)
 
         if batches[0].keys_head_dim_last:
             padded_past_keys_shape = padded_past_values_shape
@@ -402,12 +409,16 @@ class CausalLMBatch(Batch):
         # Iterate over attention layers
         # Concatenate past key values layer by layer to allow incremental garbage collection
         for j in range(len(first_past_kvs)):
-            padded_past_keys = first_past_kvs[j][0].new_zeros(padded_past_keys_shape)
+            # padded_past_keys = first_past_kvs[j][0].new_zeros(padded_past_keys_shape)
+            padded_past_keys = first_past_kvs[j][1].new_zeros(padded_past_keys_shape)
             start_index = 0
             for batch in batches:
-                past_keys = batch.past_key_values[j][0]
+                past_keys = batch.past_key_values[j][1]
+                logger.info("past_key_in")
+                logger.info(past_keys.shape)
                 # Clear reference to the original tensor
-                batch.past_key_values[j][0] = None
+                # batch.past_key_values[j][0] = None
+                batch.past_key_values[j][1] = None
 
                 # Slicing end index for this batch
                 end_index = start_index + len(batch)
@@ -415,8 +426,8 @@ class CausalLMBatch(Batch):
                 past_seq_len = batch.max_input_length - 1
                 if batch.keys_head_dim_last:
                     padded_past_keys[
-                        start_index:end_index, :, -past_seq_len:, :
-                    ] = past_keys[:, :, -past_seq_len:, :]
+                        -past_seq_len:, start_index:end_index, :, :
+                    ] = past_keys[-past_seq_len:, :, : , :]
                 else:
                     # BLOOM case
                     padded_past_keys[
@@ -425,29 +436,33 @@ class CausalLMBatch(Batch):
                 del past_keys
 
                 start_index = end_index
-
+            logger.info("padded_past_keys")
+            logger.info(padded_past_keys.shape)
             padded_past_values = first_past_kvs[j][1].new_zeros(
                 padded_past_values_shape
             )
             start_index = 0
             for batch in batches:
                 past_values = batch.past_key_values[j][1]
+                past_values = batch.past_key_values[j][2]
                 # Clear reference to the original tensor
-                batch.past_key_values[j][1] = None
+                # batch.past_key_values[j][1] = None
+                batch.past_key_values[j][2] = None
 
                 # Slicing end index for this batch
                 end_index = start_index + len(batch)
                 # We slice the past values to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
                 padded_past_values[
-                    start_index:end_index, :, -past_seq_len:, :
-                ] = past_values[:, :, -past_seq_len:, :]
+                    -past_seq_len:, start_index:end_index, :, :
+                ] = past_values[-past_seq_len:, :, :, :]
                 del past_values
 
                 # Update values
                 start_index = end_index
-
-            past_key_values.append([padded_past_keys, padded_past_values])
+            logger.info("padded_past_values")
+            logger.info(padded_past_values.shape)
+            past_key_values.append([torch.empty(0,int(batch.max_input_length ),int(batch.max_input_length ),0, dtype=torch.long), padded_past_keys, padded_past_values, torch.empty(1, 1, dtype=torch.long)])
 
         return cls(
             batch_id=batches[0].batch_id,
@@ -510,7 +525,9 @@ class CausalLM(Model):
             else None,
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
+            return_dict=False,
         )
+        model = ipex.optimize_transformers(model.eval(), dtype=dtype, inplace=True)
         if torch.cuda.is_available() and torch.cuda.device_count() == 1 and quantize != "bitsandbytes":
             model = model.cuda()
 
@@ -552,11 +569,55 @@ class CausalLM(Model):
             "use_cache": True,
             "return_dict": True,
         }
+        supported_model = False
+        input_bs = input_ids.size()[0]
+        if kwargs["past_key_values"] is None:
+            if re.search("GPTJ", self.model.config.architectures[0]):
+                supported_model = True
+                beam_idx_tmp = torch.zeros(
+                    (1, int(input_bs)), dtype=torch.long
+                ).contiguous()
+                kwargs["past_key_values"] = tuple(
+                    [
+                        (
+                            torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
+                            torch.zeros([1, 1, 1, 1]).contiguous(),
+                            torch.zeros([1, 1, 1, 1]).contiguous(),
+                            beam_idx_tmp,
+                        )
+                        for i in range(self.model.config.n_layer)
+                    ]
+                )
+            elif re.search("llama", self.model.config.architectures[0], re.IGNORECASE) or re.search("gptneox", self.model.config.architectures[0], re.IGNORECASE) or re.search("OPT", self.model.config.architectures[0], re.IGNORECASE) or re.search("falcon", self.model.config.architectures[0], re.IGNORECASE) or re.search("rw", self.model.config.architectures[0], re.IGNORECASE):
+                supported_model = True
+                beam_idx_tmp = torch.zeros(
+                    (1, int(input_bs)), dtype=torch.long
+                ).contiguous()
+                kwargs["past_key_values"] = tuple(
+                    [
+                        (
+                            torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
+                            torch.zeros([1, 1, 1, 1]).contiguous(),
+                            torch.zeros([1, 1, 1, 1]).contiguous(),
+                            beam_idx_tmp,
+                        )
+                        for i in range(self.model.config.num_hidden_layers)
+                    ]
+                )
+
         if self.has_position_ids:
             kwargs["position_ids"] = position_ids
 
-        outputs = self.model.forward(**kwargs)
-        return outputs.logits, outputs.past_key_values
+        if hasattr(self.model, "trace_graph") and supported_model:
+            logger.info("running IPEX optimized path")
+            kwargs.pop("use_cache", None)
+            kwargs.pop("return_dict", None)
+            outputs = self.model.trace_graph(**kwargs)
+        else:
+            outputs = self.model(**kwargs)
+
+        return outputs[0], outputs[1]
+        # return outputs.logits, outputs.past_key_values
 
     @tracer.start_as_current_span("generate_token")
     def generate_token(
