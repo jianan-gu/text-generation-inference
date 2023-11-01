@@ -3,7 +3,7 @@ import itertools
 from text_generation_server.utils.tokens import batch_top_tokens
 import torch
 import torch.distributed
-
+from loguru import logger
 import numpy as np
 
 from dataclasses import dataclass
@@ -721,6 +721,7 @@ class FlashCausalLM(Model):
 
     def forward(self, batch: FlashCausalLMBatch) -> Tuple[torch.Tensor, torch.Tensor]:
         # Model Forward
+        logger.info(self.model)
         return self.model.forward(
             input_ids=batch.input_ids,
             position_ids=batch.position_ids,

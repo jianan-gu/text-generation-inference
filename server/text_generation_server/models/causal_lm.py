@@ -6,6 +6,7 @@ from loguru import logger
 from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
+import re
 from typing import Optional, Tuple, List, Type, Dict
 
 from text_generation_server.models import Model

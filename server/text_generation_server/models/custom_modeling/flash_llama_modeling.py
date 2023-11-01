@@ -17,10 +17,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+from loguru import logger
 import torch
 import torch.distributed
-
+import intel_extension_for_pytorch as ipex
+import re
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
@@ -106,45 +107,50 @@ class LlamaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states, residual=None):
-        if hidden_states.shape[-1] > 8192 or not torch.cuda.is_available():
-            if residual is not None:
-                hidden_states += residual
-            residual = hidden_states
+        if residual is not None:
+            hidden_states += residual
+        residual = hidden_states
+        return torch.ops.torch_ipex.rmsnorm(hidden_states, self.weight.to(hidden_states.dtype), self.variance_epsilon), residual
 
-            hidden_states = hidden_states.to(torch.float32)
-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            hidden_states = hidden_states * torch.rsqrt(
-                variance + self.variance_epsilon
-            )
+        # if hidden_states.shape[-1] > 8192 or not torch.cuda.is_available():
+        #     if residual is not None:
+        #         hidden_states += residual
+        #     residual = hidden_states
 
-            # convert into half-precision if necessary
-            if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                hidden_states = hidden_states.to(self.weight.dtype)
+        #     hidden_states = hidden_states.to(torch.float32)
+        #     variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        #     hidden_states = hidden_states * torch.rsqrt(
+        #         variance + self.variance_epsilon
+        #     )
 
-            return self.weight * hidden_states, residual
-        else:
-            # faster post attention rms norm
-            normed_hidden_states, res, *rest = dropout_layer_norm.dropout_add_ln_fwd(
-                hidden_states,
-                residual,
-                self.weight,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0.0,
-                self.variance_epsilon,
-                1.0,
-                0,
-                None,
-                False,
-                True,  # Activate RMSNorm
-            )
-            if res is None:
-                res = hidden_states
+        #     # convert into half-precision if necessary
+        #     if self.weight.dtype in [torch.float16, torch.bfloat16]:
+        #         hidden_states = hidden_states.to(self.weight.dtype)
 
-            return normed_hidden_states, res
+        #     return self.weight * hidden_states, residual
+        # else:
+        #     # faster post attention rms norm
+        #     normed_hidden_states, res, *rest = dropout_layer_norm.dropout_add_ln_fwd(
+        #         hidden_states,
+        #         residual,
+        #         self.weight,
+        #         None,
+        #         None,
+        #         None,
+        #         None,
+        #         None,
+        #         0.0,
+        #         self.variance_epsilon,
+        #         1.0,
+        #         0,
+        #         None,
+        #         False,
+        #         True,  # Activate RMSNorm
+        #     )
+        #     if res is None:
+        #         res = hidden_states
+
+        #     return normed_hidden_states, res
 
 
 def load_attention(config, prefix, weights):
@@ -193,6 +199,97 @@ def _load_gqa(config, prefix: str, weights):
         get_linear(weight, bias=None, quantize=config.quantize)
     )
 
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, max_position_embeddings, dim, backbone, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(
+            self.max_seq_len_cached,
+            dtype=self.inv_freq.dtype,
+        )
+        self.model_backbone = str(backbone)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        if re.search("falcon", str(backbone), re.IGNORECASE) or re.search(
+            "rw", str(backbone), re.IGNORECASE
+        ):
+            self.sin_cos = torch.cat(
+                (freqs.sin().repeat(1, 2), freqs.cos().repeat(1, 2)), dim=-1
+            )
+            self.emb = torch.cat((freqs, freqs), dim=-1).float()
+            self.cos_cached = self.emb.cos()[None, :, :]
+            self.sin_cached = self.emb.sin()[None, :, :]
+        else:
+            self.sin_cos = torch.cat((torch.sin(freqs), torch.cos(freqs)), dim=1)
+            self.emb = torch.cat((freqs, freqs), dim=-1)
+            self.register_buffer(
+                "cos_cached", self.emb.cos()[None, None, :, :], persistent=False
+            )
+            self.register_buffer(
+                "sin_cached", self.emb.sin()[None, None, :, :], persistent=False
+            )
+
+    def forward(self, seq_len=None):
+        if seq_len is not None and seq_len > self.max_seq_len_cached:
+            self.max_seq_len_cached = seq_len
+            t = torch.arange(self.max_seq_len_cached, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            if re.search("falcon", self.model_backbone, re.IGNORECASE) or re.search(
+                "rw", self.model_backbone, re.IGNORECASE
+            ):
+                self.sin_cos = torch.cat(
+                    (freqs.sin().repeat(1, 2), freqs.cos().repeat(1, 2)), dim=-1
+                )
+                self.emb = torch.cat((freqs, freqs), dim=-1).float()
+                self.cos_cached = self.emb.cos()[None, :, :]
+                self.sin_cached = self.emb.sin()[None, :, :]
+            else:
+                self.sin_cos = torch.cat((torch.sin(freqs), torch.cos(freqs)), dim=1)
+                self.emb = torch.cat((freqs, freqs), dim=-1)
+                self.cos_cached = self.emb.cos()[None, None, :, :]
+                self.sin_cached = self.emb.sin()[None, None, :, :]
+                self.cos_cached[:, :, :seq_len, ...]
+                self.sin_cached[:, :, :seq_len, ...]
+        return self.sin_cos, self.sin_cached, self.cos_cached
+
+class _IPEXRopeCPU(nn.Module):
+    def __init__(
+        self,
+        max_position_embeddings,
+        pos_embd_dim,
+        base=10000,
+        backbone=None,
+    ):
+        super().__init__()
+        self.embed_positions = RotaryEmbedding(
+            max_position_embeddings, pos_embd_dim, backbone, base
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        num_head: int,
+        head_size: int,
+        offset: int,
+        rotary_ndims: int,
+        seq_len: Optional[int] = None,
+    ):
+        position_ids = position_ids.contiguous().to(torch.long)
+        sin_cos, _, _ = self.embed_positions(seq_len)
+        x = x.contiguous()
+        torch.ops.torch_ipex.rotary_position_embedding(
+            x,
+            sin_cos,
+            position_ids,
+            num_head,
+            head_size,
+            offset,
+            rotary_ndims,
+        )
+
+        return x
 
 class FlashLlamaAttention(torch.nn.Module):
     def __init__(
@@ -205,15 +302,33 @@ class FlashLlamaAttention(torch.nn.Module):
         self.num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.num_heads
-
         # self.rotary_emb = PositionRotaryEmbedding.load(
         #     config=config, prefix=f"{prefix}.rotary_emb", weights=weights
         # )
-        self.rotary_emb = PositionRotaryEmbedding.static(
-            config=config,
-            dim=self.head_size,
-            base=config.rope_theta,
-            device=weights.device,
+        # self.rotary_emb = PositionRotaryEmbedding.static(
+        #     config=config,
+        #     dim=self.head_size,
+        #     base=config.rope_theta,
+        #     device=weights.device,
+        # )
+        self.model_backbone = config.architectures[0]
+
+        self.max_position_embeddings = (
+            config.max_position_embeddings
+            if hasattr(config, "max_position_embeddings")
+            else 2048
+        )
+
+        self.pos_embd_dim = self.head_size
+        self.rope_base = (
+            config.rotary_emb_base if hasattr(config, "rotary_emb_base") else 10000
+        )
+
+        self._IPEXROPE = _IPEXRopeCPU(
+            self.max_position_embeddings,
+            self.pos_embd_dim,
+            self.rope_base,
+            self.model_backbone,
         )
 
         self.softmax_scale = self.head_size**-0.5
@@ -228,14 +343,19 @@ class FlashLlamaAttention(torch.nn.Module):
             config.num_key_value_heads // weights.process_group.size()
         )
 
-        self.query_key_value = load_attention(config, prefix, weights)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_size, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_size, self.hidden_size, bias=False)
 
-        self.o_proj = TensorParallelRowLinear.load(
-            config,
-            prefix=f"{prefix}.o_proj",
-            weights=weights,
-            bias=False,
-        )
+        # self.query_key_value = load_attention(config, prefix, weights)
+
+        # self.o_proj = TensorParallelRowLinear.load(
+        #     config,
+        #     prefix=f"{prefix}.o_proj",
+        #     weights=weights,
+        #     bias=False,
+        # )
         self.num_groups = self.num_heads // self.num_key_value_heads
         self.kv_head_mapping = torch.arange(
             0, self.num_key_value_heads, dtype=torch.int32, device=weights.device
@@ -252,38 +372,67 @@ class FlashLlamaAttention(torch.nn.Module):
         slots,
         input_lengths,
         max_s,
+        position_ids
     ):
-        qkv = self.query_key_value(hidden_states)
-        query, kv = qkv.split(
-            [
-                self.head_size * self.num_heads,
-                2 * self.head_size * self.num_key_value_heads,
-            ],
-            dim=1,
-        )
-        query = query.view(-1, self.num_heads, self.head_size)
-        kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
+        
+        # qkv = self.query_key_value(hidden_states)
+        # query, kv = qkv.split(
+        #     [
+        #         self.head_size * self.num_heads,
+        #         2 * self.head_size * self.num_key_value_heads,
+        #     ],
+        #     dim=1,
+        # )
+        # query = query.view(-1, self.num_heads, self.head_size)
+        # kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
+        logger.info(hidden_states.size())
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_size)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_size)
+        value_states = value_states.view(-1, self.num_key_value_heads, self.head_size)
 
-        self.rotary_emb(query, cos, sin)
-        self.rotary_emb(torch.select(kv, dim=1, index=0), cos, sin)
+        # self.rotary_emb(query_states, cos, sin)
+        # self.rotary_emb(key_states, cos, sin)
 
+        key_states = self._IPEXROPE(
+            key_states,
+            position_ids,
+            self.num_key_value_heads,
+            self.head_size,
+            self.head_size // 2,
+            self.head_size,
+        ).view(-1, self.num_key_value_heads, self.head_size)
+
+        query_states = self._IPEXROPE(
+            query_states,
+            position_ids,
+            self.num_heads,
+            self.head_size,
+            self.head_size // 2,
+            self.head_size,
+        ).view(-1, self.num_heads, self.head_size)
+        
         if torch.cuda.is_available():
             paged_attention.reshape_and_cache(
                 kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots
             )
         else:
-            ref_reshape_and_cache(kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots)
-
+            ref_reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
+        key_states = key_states.to(query_states.dtype)
+        value_states = value_states.to(query_states.dtype)
         # output tensor
-        attn_output = torch.empty_like(query)
+        attn_output = torch.empty_like(query_states)
 
         # Prefill
         if cu_seqlen_prefill is not None:
             # flash attention
             flash_attn.attention(
-                query,
-                torch.select(kv, dim=1, index=0),
-                torch.select(kv, dim=1, index=1),
+                query_states,
+                key_states,
+                value_states,
                 attn_output,
                 cu_seqlen_prefill,
                 max_s,
@@ -294,7 +443,7 @@ class FlashLlamaAttention(torch.nn.Module):
             if torch.cuda.is_available():
                 paged_attention.attention(
                     attn_output,
-                    query,
+                    query_states,
                     kv_cache[0],
                     kv_cache[1],
                     self.kv_head_mapping,
@@ -306,14 +455,16 @@ class FlashLlamaAttention(torch.nn.Module):
             else:
                 ref_single_query_cached_kv_attention(
                     attn_output,
-                    query,
+                    query_states.to(torch.bfloat16),
                     kv_cache[0],
                     kv_cache[1],
                     block_tables,
                     input_lengths,
                 )
 
-        return self.o_proj(attn_output.view(-1, self.num_heads * self.head_size))
+        # return self.o_proj(attn_output.view(-1, self.num_heads * self.head_size))
+        return self.o_proj(attn_output.to(self.o_proj.weight.dtype).view(bsz, q_len, self.num_heads * self.head_size))
+
 
 
 class LlamaMLP(nn.Module):
@@ -331,27 +482,32 @@ class LlamaMLP(nn.Module):
             )
         )
         # Fuse gate and up proj
-        self.gate_up_proj = TensorParallelColumnLinear.load_multi(
-            config,
-            prefixes=[f"{prefix}.gate_proj", f"{prefix}.up_proj"],
-            weights=weights,
-            dim=0,
-            bias=False,
-        )
-        self.down_proj = TensorParallelRowLinear.load(
-            config,
-            prefix=f"{prefix}.down_proj",
-            weights=weights,
-            bias=False,
-        )
-        self.intermediate_size = (
-            config.intermediate_size // weights.process_group.size()
-        )
-
+        # self.gate_up_proj = TensorParallelColumnLinear.load_multi(
+        #     config,
+        #     prefixes=[f"{prefix}.gate_proj", f"{prefix}.up_proj"],
+        #     weights=weights,
+        #     dim=0,
+        #     bias=False,
+        # )
+        # self.down_proj = TensorParallelRowLinear.load(
+        #     config,
+        #     prefix=f"{prefix}.down_proj",
+        #     weights=weights,
+        #     bias=False,
+        # )
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        # self.intermediate_size = (
+        #     config.intermediate_size // weights.process_group.size()
+        # )
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     def forward(self, hidden_states):
-        gate_up_states = self.gate_up_proj(hidden_states)
-        gate_up_states = gate_up_states.view(-1, 2, self.intermediate_size)
-        return self.down_proj(self.act(gate_up_states[:, 0]) * gate_up_states[:, 1])
+        # gate_up_states = self.gate_up_proj(hidden_states)
+        # gate_up_states = gate_up_states.view(-1, 2, self.intermediate_size)
+        # return self.down_proj(self.act(gate_up_states[:, 0]) * gate_up_states[:, 1])
+        return self.down_proj(self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
 class FlashLlamaLayer(nn.Module):
@@ -384,6 +540,7 @@ class FlashLlamaLayer(nn.Module):
         slots,
         input_lengths,
         max_s,
+        position_ids
     ):
         normed_hidden_states, res = self.input_layernorm(hidden_states, residual)
 
@@ -398,6 +555,7 @@ class FlashLlamaLayer(nn.Module):
             slots,
             input_lengths,
             max_s,
+            position_ids
         )
 
         # faster post attention rms norm
@@ -417,9 +575,12 @@ class FlashLlamaModel(torch.nn.Module):
         process_group = weights.process_group
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
-        self.embed_tokens = TensorParallelEmbedding(
-            prefix="model.embed_tokens", weights=weights
-        )
+        # self.embed_tokens = TensorParallelEmbedding(
+        #     prefix="model.embed_tokens", weights=weights
+        # )
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [
                 FlashLlamaLayer(
@@ -452,12 +613,14 @@ class FlashLlamaModel(torch.nn.Module):
         max_s: int,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-
+        hidden_states = hidden_states.unsqueeze(0)
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
-        cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
-            position_ids, max_s, hidden_states.dtype
-        )
+        # cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
+        #     position_ids, max_s, hidden_states.dtype
+        # )
+        cos = None
+        sin = None
 
         residual = None
         for i, layer in enumerate(self.layers):
@@ -472,6 +635,8 @@ class FlashLlamaModel(torch.nn.Module):
                 slots,
                 input_lengths,
                 max_s,
+                position_ids
+                
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -484,12 +649,12 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         super().__init__()
 
         self.model = FlashLlamaModel(config, weights)
-        self.lm_head = TensorParallelHead.load(
-            config,
-            prefix="lm_head",
-            weights=weights,
-        )
-
+        # self.lm_head = TensorParallelHead.load(
+        #     config,
+        #     prefix="lm_head",
+        #     weights=weights,
+        # )
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -502,6 +667,7 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         max_s: int,
         lm_head_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        
         hidden_states = self.model(
             input_ids,
             position_ids,
@@ -512,7 +678,9 @@ class FlashLlamaForCausalLM(torch.nn.Module):
             input_lengths,
             max_s,
         )
+        hidden_states=hidden_states.squeeze(0)
         if lm_head_indices is not None:
             hidden_states = hidden_states[lm_head_indices]
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states.unsqueeze(0))
+        logits = logits.squeeze(0)
         return logits

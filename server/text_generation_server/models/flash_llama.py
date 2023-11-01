@@ -5,7 +5,7 @@ from opentelemetry import trace
 from transformers import AutoConfig, AutoTokenizer
 from transformers.models.llama import LlamaTokenizer
 from typing import Optional
-
+import intel_extension_for_pytorch as ipex
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_llama_modeling import (
     FlashLlamaForCausalLM,
@@ -44,6 +44,7 @@ class FlashLlama(FlashCausalLM):
                 padding_side="left",
                 truncation_side="left",
                 trust_remote_code=trust_remote_code,
+                
             )
         except Exception:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -52,6 +53,8 @@ class FlashLlama(FlashCausalLM):
                 padding_side="left",
                 truncation_side="left",
                 trust_remote_code=trust_remote_code,
+                legacy=False
+                
             )
 
         config = LlamaConfig.from_pretrained(
@@ -67,7 +70,7 @@ class FlashLlama(FlashCausalLM):
             weights._set_gptq_params(model_id)
 
         model = FlashLlamaForCausalLM(config, weights)
-
+        model = ipex.optimize_transformers(model.eval(), dtype=torch.bfloat16, inplace=True, deployment_mode=False)
         torch.distributed.barrier(group=self.process_group)
         super(FlashLlama, self).__init__(
             model=model,
