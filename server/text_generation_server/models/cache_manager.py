@@ -26,21 +26,38 @@ class CacheManager:
         element_size = torch.tensor([], dtype=dtype).element_size()
         x = self.block_size // element_size
 
-        self.kv_cache = [
-            (
-                torch.empty(
-                    (num_blocks, num_heads, head_size // x, self.block_size, x),
-                    dtype=dtype,
-                    device=device,
-                ),
-                torch.empty(
-                    (num_blocks, num_heads, head_size, self.block_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-            )
-            for _ in range(num_layers)
-        ]
+        if device != torch.device("cpu"):
+                    self.kv_cache = [
+                        (
+                            torch.empty(
+                                (num_blocks, num_heads, head_size // x, self.block_size, x),
+                                dtype=dtype,
+                                device=device,
+                            ),
+                            torch.empty(
+                                (num_blocks, num_heads, head_size, self.block_size),
+                                dtype=dtype,
+                                device=device,
+                            ),
+                        )
+                        for _ in range(num_layers)
+                    ]
+        else:
+                    self.kv_cache = [
+                        (
+                            torch.empty(
+                                (num_blocks, self.block_size, num_heads, head_size),
+                                dtype=dtype,
+                                device=device,
+                            ),
+                            torch.empty(
+                                (num_blocks, self.block_size, num_heads, head_size),
+                                dtype=dtype,
+                                device=device,
+                            ),
+                        )
+                        for _ in range(num_layers)
+                    ]
         self.free_block_mask = torch.ones(num_blocks, dtype=torch.int32, device="cpu")
         self.slots = torch.arange(
             0, num_blocks * self.block_size, dtype=torch.int32

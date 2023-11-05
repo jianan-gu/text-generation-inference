@@ -420,7 +420,8 @@ class FlashLlamaAttention(torch.nn.Module):
                 kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots
             )
         else:
-            ref_reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
+            torch.ops.torch_ipex.ref_reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
+            # ref_reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
         key_states = key_states.to(query_states.dtype)
         value_states = value_states.to(query_states.dtype)
         # output tensor
@@ -453,14 +454,21 @@ class FlashLlamaAttention(torch.nn.Module):
                     max_s,
                 )
             else:
-                ref_single_query_cached_kv_attention(
+                torch.ops.torch_ipex.single_query_cached_kv_attention(
                     attn_output,
                     query_states.to(torch.bfloat16),
                     kv_cache[0],
                     kv_cache[1],
                     block_tables,
-                    input_lengths,
-                )
+                    input_lengths,)
+                # ref_single_query_cached_kv_attention(
+                #     attn_output,
+                #     query_states.to(torch.bfloat16),
+                #     kv_cache[0],
+                #     kv_cache[1],
+                #     block_tables,
+                #     input_lengths,
+                # )
 
         # return self.o_proj(attn_output.view(-1, self.num_heads * self.head_size))
         return self.o_proj(attn_output.to(self.o_proj.weight.dtype).view(bsz, q_len, self.num_heads * self.head_size))
