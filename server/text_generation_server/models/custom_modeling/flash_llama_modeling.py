@@ -420,8 +420,11 @@ class FlashLlamaAttention(torch.nn.Module):
                 kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots
             )
         else:
-            torch.ops.torch_ipex.ref_reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
+            key_states = key_states.to(torch.bfloat16)
+            value_states = value_states.to(torch.bfloat16)
+            torch.ops.torch_ipex.reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
             # ref_reshape_and_cache(key_states, value_states, kv_cache[0], kv_cache[1], slots)
+        query_states = query_states.to(torch.bfloat16)
         key_states = key_states.to(query_states.dtype)
         value_states = value_states.to(query_states.dtype)
         # output tensor
@@ -456,11 +459,16 @@ class FlashLlamaAttention(torch.nn.Module):
             else:
                 torch.ops.torch_ipex.single_query_cached_kv_attention(
                     attn_output,
-                    query_states.to(torch.bfloat16),
+                    query_states,
                     kv_cache[0],
                     kv_cache[1],
+                    self.kv_head_mapping,
+                    self.softmax_scale,
                     block_tables,
-                    input_lengths,)
+                    input_lengths,
+                    kv_cache[0].size(1),
+                    max_s,
+                    None)
                 # ref_single_query_cached_kv_attention(
                 #     attn_output,
                 #     query_states.to(torch.bfloat16),
