@@ -385,7 +385,7 @@ class FlashLlamaAttention(torch.nn.Module):
         # )
         # query = query.view(-1, self.num_heads, self.head_size)
         # kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
-        logger.info(hidden_states.size())
+        # logger.info(hidden_states.size())
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)

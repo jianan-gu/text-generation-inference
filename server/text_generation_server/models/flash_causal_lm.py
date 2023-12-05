@@ -721,7 +721,7 @@ class FlashCausalLM(Model):
 
     def forward(self, batch: FlashCausalLMBatch) -> Tuple[torch.Tensor, torch.Tensor]:
         # Model Forward
-        logger.info(self.model)
+        # logger.info(self.model)
         return self.model.forward(
             input_ids=batch.input_ids,
             position_ids=batch.position_ids,
