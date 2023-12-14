@@ -343,19 +343,22 @@ class FlashLlamaAttention(torch.nn.Module):
             config.num_key_value_heads // weights.process_group.size()
         )
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_size, bias=False)
+        self.o_proj_ori = TensorParallelRowLinear.load(
+            config,
+            prefix=f"{prefix}.o_proj",
+            weights=weights,
+            bias=False,
+        )
+        self.query_key_value = load_attention(config, prefix, weights)
+
+        self.qkv_proj = nn.Linear(self.hidden_size, 3*self.num_heads * self.head_size, bias=False)
+        self.qkv_proj.weight = self.query_key_value.linear.weight
         self.o_proj = nn.Linear(self.num_heads * self.head_size, self.hidden_size, bias=False)
+        self.o_proj.weight = self.o_proj_ori.linear.weight
 
-        # self.query_key_value = load_attention(config, prefix, weights)
 
-        # self.o_proj = TensorParallelRowLinear.load(
-        #     config,
-        #     prefix=f"{prefix}.o_proj",
-        #     weights=weights,
-        #     bias=False,
-        # )
+
+
         self.num_groups = self.num_heads // self.num_key_value_heads
         self.kv_head_mapping = torch.arange(
             0, self.num_key_value_heads, dtype=torch.int32, device=weights.device
@@ -387,9 +390,13 @@ class FlashLlamaAttention(torch.nn.Module):
         # kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
         # logger.info(hidden_states.size())
         bsz, q_len, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # query_states = self.q_proj(hidden_states)
+        # key_states = self.k_proj(hidden_states)
+        # value_states = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        query_states = qkv[..., : self.hidden_size]
+        key_states = qkv[..., self.hidden_size : 2 * self.hidden_size]
+        value_states = qkv[..., 2 * self.hidden_size :]
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_size)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_size)
         value_states = value_states.view(-1, self.num_key_value_heads, self.head_size)
@@ -498,32 +505,50 @@ class LlamaMLP(nn.Module):
             )
         )
         # Fuse gate and up proj
-        # self.gate_up_proj = TensorParallelColumnLinear.load_multi(
+        self.gate_up_proj_ori = TensorParallelColumnLinear.load_multi(
+            config,
+            prefixes=[f"{prefix}.gate_proj", f"{prefix}.up_proj"],
+            weights=weights,
+            dim=0,
+            bias=False,
+        )
+        # self.gate_proj_ori = TensorParallelColumnLinear.load(
         #     config,
-        #     prefixes=[f"{prefix}.gate_proj", f"{prefix}.up_proj"],
+        #     prefix=f"{prefix}.gate_proj",
         #     weights=weights,
-        #     dim=0,
         #     bias=False,
         # )
-        # self.down_proj = TensorParallelRowLinear.load(
+        # self.up_proj_ori = TensorParallelColumnLinear.load(
         #     config,
-        #     prefix=f"{prefix}.down_proj",
+        #     prefix=f"{prefix}.up_proj",
         #     weights=weights,
         #     bias=False,
         # )
+        self.down_proj_ori = TensorParallelRowLinear.load(
+            config,
+            prefix=f"{prefix}.down_proj",
+            weights=weights,
+            bias=False,
+        )
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         # self.intermediate_size = (
         #     config.intermediate_size // weights.process_group.size()
         # )
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        # self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        # self.gate_proj.weight = self.gate_proj_ori.linear.weight
+        # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        # self.up_proj.weight = self.up_proj_ori.linear.weight
+        self.gate_up_proj = nn.Linear(self.hidden_size, 2*self.intermediate_size, bias=False)
+        self.gate_up_proj.weight = self.gate_up_proj_ori.linear.weight
+
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.down_proj.weight = self.down_proj_ori.linear.weight
     def forward(self, hidden_states):
-        # gate_up_states = self.gate_up_proj(hidden_states)
-        # gate_up_states = gate_up_states.view(-1, 2, self.intermediate_size)
-        # return self.down_proj(self.act(gate_up_states[:, 0]) * gate_up_states[:, 1])
-        return self.down_proj(self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        gate_up_states = self.gate_up_proj(hidden_states)
+        gate_up_states = gate_up_states.view(-1, 2, self.intermediate_size)
+        return self.down_proj((self.act(gate_up_states[:, 0]) * gate_up_states[:, 1]).unsqueeze(0))
+        # return self.down_proj(self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
 class FlashLlamaLayer(nn.Module):
@@ -591,12 +616,13 @@ class FlashLlamaModel(torch.nn.Module):
         process_group = weights.process_group
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
-        # self.embed_tokens = TensorParallelEmbedding(
-        #     prefix="model.embed_tokens", weights=weights
-        # )
+        self.embed_tokens_ori = TensorParallelEmbedding(
+            prefix="model.embed_tokens", weights=weights
+        )
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens.weight = self.embed_tokens_ori.weight
         self.layers = nn.ModuleList(
             [
                 FlashLlamaLayer(
@@ -630,7 +656,7 @@ class FlashLlamaModel(torch.nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(0)
-        
+
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
         # cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
@@ -666,12 +692,13 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         super().__init__()
 
         self.model = FlashLlamaModel(config, weights)
-        # self.lm_head = TensorParallelHead.load(
-        #     config,
-        #     prefix="lm_head",
-        #     weights=weights,
-        # )
+        self.lm_head_ori = TensorParallelHead.load(
+            config,
+            prefix="lm_head",
+            weights=weights,
+        )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head.weight = self.lm_head_ori.linear.weight
     def forward(
         self,
         input_ids: torch.Tensor,
