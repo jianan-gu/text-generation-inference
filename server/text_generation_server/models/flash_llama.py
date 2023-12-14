@@ -75,9 +75,9 @@ class FlashLlama(FlashCausalLM):
         num_layers = len(model.model.layers)
         num_kv_heads = model.model.num_key_value_heads
         head_size = model.model.head_size
-        #_enable_tpp()
+        _enable_tpp()
 
-        #model = ipex.optimize(model.eval(), dtype=torch.bfloat16, graph_mode=False)#deployment_mode=False)
+        model = ipex.optimize(model.eval(), dtype=torch.bfloat16, graph_mode=False, conv_bn_folding=False, linear_bn_folding=False)
 
         logger.info("running llama flash version!!!!")
         torch.distributed.barrier(group=self.process_group)

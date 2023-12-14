@@ -28,10 +28,10 @@ from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple
 
 # Flash attention imports
-if torch.cuda.is_available():
-    import dropout_layer_norm
+# if torch.cuda.is_available():
+#     import dropout_layer_norm
 
-from text_generation_server.utils import paged_attention, flash_attn
+from text_generation_server.utils import flash_attn #paged_attention, 
 from text_generation_server.utils.flash_attn import attention, ref_reshape_and_cache, ref_single_query_cached_kv_attention
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
@@ -630,6 +630,7 @@ class FlashLlamaModel(torch.nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(0)
+        
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
         # cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(

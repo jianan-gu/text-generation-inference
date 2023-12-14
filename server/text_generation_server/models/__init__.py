@@ -46,26 +46,26 @@ FLASH_ATT_ERROR_MESSAGE = "{} requires Flash Attention enabled models."
 
 FLASH_ATTENTION = True
 try:
-    from text_generation_server.models.flash_rw import FlashRWSharded
-    from text_generation_server.models.flash_neox import FlashNeoXSharded
+    # from text_generation_server.models.flash_rw import FlashRWSharded
+    # from text_generation_server.models.flash_neox import FlashNeoXSharded
     from text_generation_server.models.flash_llama import (
         FlashLlama,
     )
-    from text_generation_server.models.flash_santacoder import (
-        FlashSantacoderSharded,
-    )
-    from text_generation_server.models.idefics import IDEFICSSharded
+    # from text_generation_server.models.flash_santacoder import (
+    #     FlashSantacoderSharded,
+    # )
+    # from text_generation_server.models.idefics import IDEFICSSharded
 
 except ImportError as e:
     logger.warning(f"Could not import Flash Attention enabled models: {e}")
     FLASH_ATTENTION = False
 
 if FLASH_ATTENTION:
-    __all__.append(FlashNeoXSharded)
-    __all__.append(FlashRWSharded)
-    __all__.append(FlashSantacoderSharded)
+    # __all__.append(FlashNeoXSharded)
+    # __all__.append(FlashRWSharded)
+    # __all__.append(FlashSantacoderSharded)
     __all__.append(FlashLlama)
-    __all__.append(IDEFICSSharded)
+    # __all__.append(IDEFICSSharded)
 
 MISTRAL = True
 try:
